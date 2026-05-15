@@ -8,7 +8,7 @@ export const translations = {
     
     // Home page
     welcome: 'Добро пожаловать',
-    welcomeDescription: 'Это бесплатная анкета по здоровью. Заполните форму, и мы свяжемся с вами для консультации.',
+    welcomeDescription: 'Это бесплатная анкета по здоровью. Заполните форму и мы свяжемся с вами для консультации.',
     selectCategory: 'Выберите категорию анкеты',
     
     // Categories
