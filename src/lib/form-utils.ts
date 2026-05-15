@@ -1,0 +1,804 @@
+import { QuestionnaireSection, QuestionnaireType, Question } from './questionnaire-data';
+import { Language, translations } from './translations';
+import { getTelegramBotToken, getTelegramChatId } from '@/lib/telegram-env';
+
+// Helper function for Russian number declension
+const getRussianDeclension = (num: number, forms: [string, string, string]): string => {
+  const absNum = Math.abs(num);
+  const lastTwo = absNum % 100;
+  const lastOne = absNum % 10;
+  
+  if (lastTwo >= 11 && lastTwo <= 19) {
+    return forms[2]; // 11-19: литров, миллилитров, килограммов
+  }
+  if (lastOne === 1) {
+    return forms[0]; // 1, 21, 31...: литр, миллилитр, килограмм
+  }
+  if (lastOne >= 2 && lastOne <= 4) {
+    return forms[1]; // 2-4, 22-24...: литра, миллилитра, килограмма
+  }
+  return forms[2]; // 0, 5-20, 25-30...: литров, миллилитров, килограммов
+};
+
+// Format value with unit
+const formatValueWithUnit = (value: string, unit: Question['unit'], lang: Language): string => {
+  if (!unit || !value) return value;
+  
+  const numValue = parseFloat(value);
+  if (isNaN(numValue)) return value;
+  
+  if (lang === 'ru') {
+    switch (unit) {
+      case 'ml':
+        return `${value} ${getRussianDeclension(numValue, ['миллилитр', 'миллилитра', 'миллилитров'])}`;
+      case 'liters':
+        return `${value} ${getRussianDeclension(numValue, ['литр', 'литра', 'литров'])}`;
+      case 'kg':
+        return `${value} ${getRussianDeclension(numValue, ['килограмм', 'килограмма', 'килограммов'])}`;
+      case 'cm':
+        return `${value} см`;
+      case 'years':
+        return `${value} ${getRussianDeclension(numValue, ['год', 'года', 'лет'])}`;
+      case 'months':
+        return `${value} ${getRussianDeclension(numValue, ['месяц', 'месяца', 'месяцев'])}`;
+      default:
+        return value;
+    }
+  } else {
+    // English
+    switch (unit) {
+      case 'ml':
+        return `${value} ml`;
+      case 'liters':
+        return `${value} ${numValue === 1 ? 'liter' : 'liters'}`;
+      case 'kg':
+        return `${value} kg`;
+      case 'cm':
+        return `${value} cm`;
+      case 'years':
+        return `${value} ${numValue === 1 ? 'year' : 'years'}`;
+      case 'months':
+        return `${value} ${numValue === 1 ? 'month' : 'months'}`;
+      default:
+        return value;
+    }
+  }
+};
+
+export interface FormData {
+  [key: string]: string | string[];
+}
+
+export interface FormAdditionalData {
+  [key: string]: string;
+}
+
+export interface ContactData {
+  telegram?: string;
+  instagram?: string;
+  phone?: string;
+}
+
+export interface FormErrors {
+  [key: string]: string;
+}
+
+// Storage keys
+const getStorageKey = (type: QuestionnaireType, lang: Language) => 
+  `health_questionnaire_${type}_${lang}`;
+
+// Save form data to localStorage
+export const saveFormData = (
+  type: QuestionnaireType,
+  lang: Language,
+  formData: FormData,
+  additionalData: FormAdditionalData,
+  contactData: ContactData
+) => {
+  try {
+    const data = { formData, additionalData, contactData, timestamp: Date.now() };
+    localStorage.setItem(getStorageKey(type, lang), JSON.stringify(data));
+  } catch (err) {
+    console.error('Error saving form data:', err);
+  }
+};
+
+// Load form data from localStorage
+export const loadFormData = (type: QuestionnaireType, lang: Language) => {
+  try {
+    const stored = localStorage.getItem(getStorageKey(type, lang));
+    if (stored) {
+      const data = JSON.parse(stored);
+      // Only return if data is less than 24 hours old
+      if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
+        return {
+          formData: data.formData as FormData,
+          additionalData: data.additionalData as FormAdditionalData,
+          contactData: data.contactData as ContactData,
+        };
+      }
+    }
+  } catch (err) {
+    console.error('Error loading form data:', err);
+  }
+  return null;
+};
+
+// Clear form data from localStorage
+export const clearFormData = (type: QuestionnaireType, lang: Language) => {
+  try {
+    localStorage.removeItem(getStorageKey(type, lang));
+  } catch (err) {
+    console.error('Error clearing form data:', err);
+  }
+};
+
+// Validate form
+export const validateForm = (
+  sections: QuestionnaireSection[],
+  formData: FormData,
+  contactData: ContactData,
+  lang: Language,
+  additionalData?: FormAdditionalData,
+  uploadedFiles?: Record<string, File[]>
+): FormErrors => {
+  const errors: FormErrors = {};
+  const t = translations[lang];
+
+  sections.forEach((section) => {
+    section.questions.forEach((question) => {
+      // Skip conditionally hidden fields
+      if (question.id === 'pressure_medication' && formData['pressure'] !== 'high') {
+        return;
+      }
+      if (question.id === 'weight_change' && formData['weight_satisfaction'] !== 'no') {
+        return;
+      }
+      if (question.id === 'attach_files' && formData['has_tests_or_ultrasound'] !== 'yes') {
+        return;
+      }
+      if (question.id === 'covid_times' && formData['covid_had'] !== 'yes') {
+        return;
+      }
+      if (question.id === 'covid_doses' && formData['covid_vaccinated'] !== 'yes') {
+        return;
+      }
+      if (question.id === 'covid_complications' && formData['covid_had'] !== 'yes' && formData['covid_vaccinated'] !== 'yes') {
+        return;
+      }
+
+      if (question.required) {
+        const value = formData[question.id];
+        
+        if (question.type === 'checkbox') {
+          if (!value || (Array.isArray(value) && value.length === 0)) {
+            errors[question.id] = t.selectAtLeastOne;
+          }
+        } else if (question.type === 'number') {
+          if (!value || value === '' || isNaN(Number(value))) {
+            errors[question.id] = t.required;
+          }
+        } else {
+          if (!value || (typeof value === 'string' && value.trim() === '')) {
+            errors[question.id] = t.required;
+          }
+        }
+      }
+
+      // Generic validation: if "other" is selected in any question with hasAdditional, the additional field is required
+      if (question.hasAdditional && additionalData && (question.type === 'radio' || question.type === 'checkbox')) {
+        const value = formData[question.id];
+        const valueArray = Array.isArray(value) ? value : [value];
+        const hasOther = valueArray.includes('other');
+        
+        if (hasOther) {
+          const additionalValue = additionalData[`${question.id}_additional`];
+          if (!additionalValue || additionalValue.trim() === '') {
+            errors[`${question.id}_additional`] = t.required;
+          }
+        }
+      }
+    });
+  });
+
+  // Special validation: if operations is "yes", additional field is required
+  if (formData['operations'] === 'yes' && additionalData) {
+    const operationsAdditional = additionalData['operations_additional'];
+    if (!operationsAdditional || operationsAdditional.trim() === '') {
+      errors['operations_additional'] = t.required;
+    }
+  }
+
+  // Special validation: if pregnancy_problems is "yes", additional field is required (for infant/child questionnaires)
+  if (formData['pregnancy_problems'] === 'yes' && additionalData) {
+    const pregnancyProblemsAdditional = additionalData['pregnancy_problems_additional'];
+    if (!pregnancyProblemsAdditional || pregnancyProblemsAdditional.trim() === '') {
+      errors['pregnancy_problems_additional'] = t.required;
+    }
+  }
+
+  // Special validation: if injuries has any option selected except "no_issues", additional field is required (for infant/child questionnaires)
+  if (formData['injuries'] && additionalData) {
+    const injuriesValue = formData['injuries'];
+    const injuriesArray = Array.isArray(injuriesValue) ? injuriesValue : [injuriesValue];
+    // Check if any option other than "no_issues" is selected
+    const hasOtherThanNoIssues = injuriesArray.some((val: string) => val !== 'no_issues');
+    if (hasOtherThanNoIssues) {
+      const injuriesAdditional = additionalData['injuries_additional'];
+      if (!injuriesAdditional || injuriesAdditional.trim() === '') {
+        errors['injuries_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if serious_injuries is "yes", additional field is required (for adult questionnaires)
+  if (formData['serious_injuries'] === 'yes' && additionalData) {
+    const seriousInjuriesAdditional = additionalData['serious_injuries_additional'];
+    if (!seriousInjuriesAdditional || seriousInjuriesAdditional.trim() === '') {
+      errors['serious_injuries_additional'] = t.required;
+    }
+  }
+
+  // Special validation: if allergies_present has "other" selected, additional field is required
+  if (formData['allergies_present'] && additionalData) {
+    const allergiesValue = formData['allergies_present'];
+    const allergiesArray = Array.isArray(allergiesValue) ? allergiesValue : [allergiesValue];
+    const hasOther = allergiesArray.includes('other');
+    if (hasOther) {
+      const allergiesAdditional = additionalData['allergies_present_additional'];
+      if (!allergiesAdditional || allergiesAdditional.trim() === '') {
+        errors['allergies_present_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if allergies has "other" selected (for backward compatibility with child/infant)
+  if (formData['allergies'] && additionalData) {
+    const allergiesValue = formData['allergies'];
+    const allergiesArray = Array.isArray(allergiesValue) ? allergiesValue : [allergiesValue];
+    const hasOther = allergiesArray.includes('other');
+    if (hasOther) {
+      const allergiesAdditional = additionalData['allergies_additional'];
+      if (!allergiesAdditional || allergiesAdditional.trim() === '') {
+        errors['allergies_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if skin_problems has "other" selected, additional field is required
+  if (formData['skin_problems'] && additionalData) {
+    const skinProblemsValue = formData['skin_problems'];
+    const skinProblemsArray = Array.isArray(skinProblemsValue) ? skinProblemsValue : [skinProblemsValue];
+    const hasOther = skinProblemsArray.includes('other');
+    if (hasOther) {
+      const skinProblemsAdditional = additionalData['skin_problems_additional'];
+      if (!skinProblemsAdditional || skinProblemsAdditional.trim() === '') {
+        errors['skin_problems_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if skin_condition has "other" selected (for backward compatibility)
+  if (formData['skin_condition'] && additionalData) {
+    const skinConditionValue = formData['skin_condition'];
+    const skinConditionArray = Array.isArray(skinConditionValue) ? skinConditionValue : [skinConditionValue];
+    const hasOther = skinConditionArray.includes('other');
+    if (hasOther) {
+      const skinConditionAdditional = additionalData['skin_condition_additional'];
+      if (!skinConditionAdditional || skinConditionAdditional.trim() === '') {
+        errors['skin_condition_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if chronic_autoimmune has "other" selected, additional field is required
+  if (formData['chronic_autoimmune'] && additionalData) {
+    const chronicValue = formData['chronic_autoimmune'];
+    const chronicArray = Array.isArray(chronicValue) ? chronicValue : [chronicValue];
+    const hasOther = chronicArray.includes('other');
+    if (hasOther) {
+      const chronicAdditional = additionalData['chronic_autoimmune_additional'];
+      if (!chronicAdditional || chronicAdditional.trim() === '') {
+        errors['chronic_autoimmune_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if covid_complications has "other" selected, additional field is required
+  if (formData['covid_complications'] && additionalData) {
+    const covidValue = formData['covid_complications'];
+    const covidArray = Array.isArray(covidValue) ? covidValue : [covidValue];
+    const hasOther = covidArray.includes('other');
+    if (hasOther) {
+      const covidAdditional = additionalData['covid_complications_additional'];
+      if (!covidAdditional || covidAdditional.trim() === '') {
+        errors['covid_complications_additional'] = t.required;
+      }
+    }
+  }
+
+  // Special validation: if how_learned is "recommendation", additional field is required
+  if (formData['how_learned'] === 'recommendation' && additionalData) {
+    const howLearnedAdditional = additionalData['how_learned_additional'];
+    if (!howLearnedAdditional || howLearnedAdditional.trim() === '') {
+      errors['how_learned_additional'] = t.required;
+    }
+  }
+
+  // Special validation: if diabetes has "diabetes_stage" selected (for backward compatibility)
+  if (formData['diabetes'] && additionalData) {
+    const diabetesValue = formData['diabetes'];
+    const diabetesArray = Array.isArray(diabetesValue) ? diabetesValue : [diabetesValue];
+    const hasDiabetesStage = diabetesArray.includes('diabetes_stage');
+    if (hasDiabetesStage) {
+      const diabetesAdditional = additionalData['diabetes_additional'];
+      if (!diabetesAdditional || diabetesAdditional.trim() === '') {
+        errors['diabetes_additional'] = t.required;
+      }
+    }
+  }
+
+  // Validate files: if "has_tests_or_ultrasound" is "yes", at least one file must be uploaded
+  if (formData['has_tests_or_ultrasound'] === 'yes') {
+    const files = uploadedFiles?.['attach_files'] || [];
+    if (files.length === 0) {
+      errors['attach_files'] = lang === 'ru' 
+        ? 'Прикрепите хотя бы один файл с анализами' 
+        : 'Please attach at least one file with test results';
+    }
+  }
+
+  // Validate contact: at least one contact method is required
+  const cleanTg = (contactData.telegram || '').replace(/^@/, '').trim();
+  const cleanIg = (contactData.instagram || '').replace(/^@/, '').trim();
+  const cleanPhone = (contactData.phone || '').trim();
+  const hasTelegram = cleanTg.length >= 5 && /^[a-zA-Z0-9_]{5,32}$/.test(cleanTg);
+  const hasInstagram = cleanIg.length > 0;
+  const hasPhone = cleanPhone.length > 0;
+
+  if (!hasTelegram && !hasInstagram && !hasPhone) {
+    errors['contact_method'] = lang === 'ru' 
+      ? 'Укажите хотя бы один способ связи'
+      : 'Please provide at least one contact method.';
+  }
+
+  if (cleanTg.length > 0 && !hasTelegram) {
+    errors['contact_telegram'] = lang === 'ru'
+      ? 'Неверный формат Telegram username (5–32 символа, латиница, цифры, _)'
+      : 'Invalid Telegram username (5-32 chars, latin, digits, _)';
+  }
+
+  return errors;
+};
+
+// Escape special characters for HTML (Telegram supports HTML parse mode)
+const escapeHtml = (text: string): string => {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+};
+
+const TG_SEPARATOR = '━━━━━━━━━━━━━━━━━━━━';
+
+const GENERIC_QUESTION_LABELS = [
+  'Отметьте подходящее',
+  'Select applicable',
+  'Mark applicable',
+  'Check what applies',
+];
+
+/** Personal fields order in Telegram (matches typical «Имя → возраст → вес → рост» blocks). */
+const PERSONAL_FIELD_ORDER = ['name', 'last_name', 'age', 'age_months', 'weight', 'height'];
+
+const hasFormValue = (value: string | string[] | undefined): boolean => {
+  if (value === undefined || value === null) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  return typeof value === 'string' && value.trim() !== '';
+};
+
+const includeQuestionInTelegram = (question: Question, formData: FormData): boolean => {
+  if (question.id === 'attach_files' && formData['has_tests_or_ultrasound'] !== 'yes') return false;
+  if (question.id === 'covid_times' && formData['covid_had'] !== 'yes') return false;
+  if (question.id === 'covid_doses' && formData['covid_vaccinated'] !== 'yes') return false;
+  if (
+    question.id === 'covid_complications' &&
+    formData['covid_had'] !== 'yes' &&
+    formData['covid_vaccinated'] !== 'yes'
+  ) {
+    return false;
+  }
+  return true;
+};
+
+const sectionHasAnswers = (section: QuestionnaireSection, formData: FormData): boolean =>
+  section.questions.some((question) => {
+    if (!includeQuestionInTelegram(question, formData)) return false;
+    return hasFormValue(formData[question.id]);
+  });
+
+const sortPersonalQuestions = (questions: Question[]): Question[] =>
+  [...questions].sort((a, b) => {
+    const ia = PERSONAL_FIELD_ORDER.indexOf(a.id);
+    const ib = PERSONAL_FIELD_ORDER.indexOf(b.id);
+    const ra = ia === -1 ? 1000 : ia;
+    const rb = ib === -1 ? 1000 : ib;
+    return ra - rb;
+  });
+
+const formatTelegramSubmissionDate = (lang: Language): string => {
+  const now = new Date();
+  const locale = lang === 'ru' ? 'ru-RU' : 'en-GB';
+  return new Intl.DateTimeFormat(locale, {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(now);
+};
+
+const resolveQuestionHeading = (
+  section: QuestionnaireSection,
+  question: Question,
+  lang: Language
+): string => {
+  const sectionTitle = (section.title[lang] || '').replace(/\s+/g, ' ').trim();
+  const questionLabel = (question.label[lang] || '').replace(/\s+/g, ' ').trim();
+  if (GENERIC_QUESTION_LABELS.includes(questionLabel) || questionLabel === sectionTitle) {
+    return sectionTitle;
+  }
+  return questionLabel;
+};
+
+const formatAnswerBodyLines = (
+  question: Question,
+  value: string | string[],
+  additional: string | undefined,
+  lang: Language
+): string[] => {
+  const additionalTrim = additional?.trim() ?? '';
+
+  if (question.type === 'file') {
+    const count = String(value).split(',').filter((s) => s.trim() !== '').length;
+    const text = lang === 'ru' ? `Прикреплено файлов: ${count}` : `Attached files: ${count}`;
+    return [escapeHtml(text)];
+  }
+
+  if (Array.isArray(value)) {
+    const rawLines: string[] = [];
+    for (const v of value) {
+      const opt = question.options?.find((o) => o.value === v);
+      let label = opt ? opt.label[lang] : v;
+      if (v === 'other' && additionalTrim) {
+        label = `${label}: ${additionalTrim}`;
+      }
+      rawLines.push(label);
+    }
+    if (rawLines.length === 0) return [];
+    if (rawLines.length === 1) {
+      return [escapeHtml(rawLines[0])];
+    }
+    return rawLines.map((l) => `• ${escapeHtml(l)}`);
+  }
+
+  let answerText = '';
+  if (question.options) {
+    const opt = question.options.find((o) => o.value === value);
+    answerText = opt ? opt.label[lang] : String(value);
+  } else {
+    answerText = question.unit ? formatValueWithUnit(String(value), question.unit, lang) : String(value);
+  }
+
+  if (additionalTrim) {
+    answerText += ` (${additionalTrim})`;
+  }
+
+  return [escapeHtml(answerText)];
+};
+
+// Telegram HTML message body (also shown in preview)
+export const generateMarkdown = (
+  type: QuestionnaireType,
+  sections: QuestionnaireSection[],
+  formData: FormData,
+  additionalData: FormAdditionalData,
+  contactData: ContactData,
+  lang: Language
+): string => {
+  const t = translations[lang];
+  const plainTitles: Record<QuestionnaireType, string> = {
+    infant: t.mdInfantPlain,
+    child: t.mdChildPlain,
+    woman: t.mdWomanPlain,
+    man: t.mdManPlain,
+  };
+
+  const lines: string[] = [];
+
+  lines.push(`${escapeHtml(t.mdNewQuestionnaire)} ${escapeHtml(plainTitles[type])}`);
+  lines.push(`${escapeHtml(t.mdDateLabel)} ${escapeHtml(formatTelegramSubmissionDate(lang))}`);
+  lines.push('');
+  lines.push(TG_SEPARATOR);
+  lines.push('');
+
+  let questionNum = 1;
+
+  sections.forEach((section) => {
+    if (!sectionHasAnswers(section, formData)) return;
+
+    if (section.id === 'personal') {
+      lines.push(escapeHtml(t.mdMainInfo));
+      sortPersonalQuestions(section.questions).forEach((question) => {
+        if (!includeQuestionInTelegram(question, formData)) return;
+        const value = formData[question.id];
+        if (!hasFormValue(value)) return;
+        const body = formatAnswerBodyLines(question, value, additionalData[`${question.id}_additional`], lang);
+        const answerJoined = body.join('\n').replace(/\n/g, ' ');
+        lines.push(`${escapeHtml(question.label[lang])}: ${answerJoined}`);
+      });
+      lines.push('');
+      return;
+    }
+
+    section.questions.forEach((question) => {
+      if (!includeQuestionInTelegram(question, formData)) return;
+      const value = formData[question.id];
+      if (!hasFormValue(value)) return;
+
+      const heading = resolveQuestionHeading(section, question, lang);
+      const additional = additionalData[`${question.id}_additional`];
+
+      lines.push(`${questionNum}. ${escapeHtml(heading)}:`);
+      questionNum += 1;
+
+      formatAnswerBodyLines(question, value, additional, lang).forEach((bl) => lines.push(bl));
+      lines.push('');
+    });
+  });
+
+  lines.push(TG_SEPARATOR);
+
+  const contactLines: string[] = [];
+  if (contactData.telegram?.trim()) {
+    const cleanTelegram = contactData.telegram.replace(/^@/, '').trim();
+    const telegramLink = `https://t.me/${cleanTelegram}`;
+    contactLines.push(
+      `Telegram: <a href="${telegramLink}">${escapeHtml('@' + cleanTelegram)}</a>`
+    );
+  }
+  if (contactData.instagram?.trim()) {
+    const cleanInstagram = contactData.instagram.replace(/^@/, '').trim();
+    const instagramLink = `https://instagram.com/${cleanInstagram}`;
+    contactLines.push(
+      `Instagram: <a href="${instagramLink}">${escapeHtml('@' + cleanInstagram)}</a>`
+    );
+  }
+  if (contactData.phone?.trim()) {
+    const cleanPhone = contactData.phone.trim();
+    const phoneLink = `tel:${cleanPhone}`;
+    const phoneLabel = lang === 'ru' ? 'Телефон' : 'Phone';
+    contactLines.push(`${phoneLabel}: <a href="${phoneLink}">${escapeHtml(cleanPhone)}</a>`);
+  }
+
+  if (contactLines.length > 0) {
+    lines.push('');
+    lines.push(escapeHtml(t.mdContactsDetailed));
+    contactLines.forEach((cl) => lines.push(cl));
+  }
+
+  lines.push('');
+  lines.push(TG_SEPARATOR);
+  lines.push('');
+  lines.push(escapeHtml(t.mdFilledViaWebsite));
+
+  return lines.join('\n').replace(/\n+$/, '');
+};
+
+// Check if file is an image (for Telegram: send as photo so it's viewable inline)
+const isImageFile = (file: File): boolean => {
+  const type = (file.type || '').toLowerCase();
+  if (type.startsWith('image/')) return true;
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
+};
+
+// Send file to Telegram (images via sendPhoto for inline viewing, rest via sendDocument)
+const sendFileToTelegram = async (
+  botToken: string,
+  chatId: string,
+  file: File,
+  caption?: string
+): Promise<{ success: boolean; error?: string }> => {
+  try {
+    const formData = new FormData();
+    formData.append('chat_id', chatId);
+    const isImage = isImageFile(file);
+    if (isImage) {
+      formData.append('photo', file, file.name);
+    } else {
+      formData.append('document', file, file.name);
+    }
+    if (caption) {
+      formData.append('caption', caption);
+    }
+
+    const endpoint = isImage
+      ? `https://api.telegram.org/bot${botToken}/sendPhoto`
+      : `https://api.telegram.org/bot${botToken}/sendDocument`;
+
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      body: formData,
+    });
+
+    const responseData = await response.json();
+
+    if (!response.ok || !responseData.ok) {
+      const errorMsg = responseData.description || 'Failed to send file';
+      console.error('Telegram file upload error:', errorMsg);
+      return { success: false, error: errorMsg };
+    }
+
+    return { success: true };
+  } catch (error: any) {
+    console.error('Error sending file to Telegram:', error);
+    return { 
+      success: false, 
+      error: error.message || 'Unknown error occurred' 
+    };
+  }
+};
+
+// Send to Telegram
+// SECURITY NOTE: In production, use environment variables or a server-side proxy
+// Do not expose BOT_TOKEN in client-side code in production!
+// For development: Set VITE_TELEGRAM_BOT_TOKEN and VITE_TELEGRAM_CHAT_ID in .env file
+export const sendToTelegram = async (
+  markdown: string,
+  files: File[] = [],
+  lang: Language = 'ru'
+): Promise<{ success: boolean; error?: string; messageId?: number }> => {
+  const BOT_TOKEN = getTelegramBotToken();
+  const CHAT_ID = getTelegramChatId();
+
+  if (!BOT_TOKEN || !CHAT_ID) {
+    const errorMsg =
+      lang === 'ru'
+        ? 'Telegram не настроен. В Vercel добавьте NEXT_PUBLIC_TELEGRAM_BOT_TOKEN и NEXT_PUBLIC_TELEGRAM_CHAT_ID, затем пересоберите проект.'
+        : 'Telegram is not configured. Add NEXT_PUBLIC_TELEGRAM_BOT_TOKEN and NEXT_PUBLIC_TELEGRAM_CHAT_ID in Vercel, then redeploy.';
+    
+    console.error('Environment variables check failed:', {
+      BOT_TOKEN: BOT_TOKEN ? 'SET (hidden)' : 'NOT SET',
+      CHAT_ID: CHAT_ID ? 'SET (hidden)' : 'NOT SET'
+    });
+    return { success: false, error: errorMsg };
+  }
+
+  // Log payload for debugging
+  console.log('Sending to Telegram...', { 
+    chatId: CHAT_ID.substring(0, 4) + '...', 
+    textLength: markdown.length,
+    hasToken: !!BOT_TOKEN,
+    hasChatId: !!CHAT_ID
+  });
+
+  // Create AbortController for timeout
+  const controller = new AbortController();
+  let timeoutId: NodeJS.Timeout | null = null;
+
+  try {
+    timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          text: markdown,
+          parse_mode: 'HTML',
+        }),
+        signal: controller.signal,
+      }
+    );
+
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const responseData = await response.json();
+
+    if (!response.ok) {
+      const errorMsg = responseData.description || `HTTP ${response.status}`;
+      console.error('Telegram API error:', {
+        status: response.status,
+        statusText: response.statusText,
+        error: responseData
+      });
+      return { 
+        success: false, 
+        error: `Telegram API error: ${errorMsg}` 
+      };
+    }
+
+    if (!responseData.ok) {
+      const errorMsg = responseData.description || 'Unknown Telegram API error';
+      console.error('Telegram API returned error:', responseData);
+      return { 
+        success: false, 
+        error: `Telegram API error: ${errorMsg}` 
+      };
+    }
+
+    const messageId = responseData.result?.message_id;
+    console.log('Successfully sent message to Telegram', { 
+      messageId,
+      filesCount: files.length
+    });
+
+    // Send files if any
+    if (files.length > 0) {
+      console.log('Sending files to Telegram...', { count: files.length });
+      const t = translations[lang];
+      const filesCaption = lang === 'ru' 
+        ? `${t.filesToQuestionnaire} (${files.length} ${files.length === 1 ? 'файл' : files.length < 5 ? 'файла' : 'файлов'})`
+        : `${t.filesToQuestionnaire} (${files.length} ${files.length === 1 ? 'file' : 'files'})`;
+      const fileResults = await Promise.allSettled(
+        files.map((file, index) => 
+          sendFileToTelegram(
+            BOT_TOKEN,
+            CHAT_ID,
+            file,
+            index === 0 ? filesCaption : undefined
+          )
+        )
+      );
+
+      const failedFiles = fileResults
+        .map((result, index) => ({ result, index }))
+        .filter(({ result }) => result.status === 'rejected' || 
+          (result.status === 'fulfilled' && !result.value.success));
+
+      if (failedFiles.length > 0) {
+        console.warn('Some files failed to upload:', failedFiles);
+        // Don't fail the whole submission if files fail, but log it
+      } else {
+        console.log('All files sent successfully');
+      }
+    }
+
+    return { 
+      success: true, 
+      messageId: messageId 
+    };
+  } catch (error: any) {
+    if (timeoutId) clearTimeout(timeoutId);
+    
+    let errorMessage = 'Unknown error occurred';
+    
+    if (error.name === 'AbortError') {
+      errorMessage = 'Request timeout. Please check your internet connection and try again.';
+    } else if (error instanceof TypeError && error.message.includes('fetch')) {
+      errorMessage = 'Network error. Please check your internet connection and try again.';
+    } else if (error.message) {
+      errorMessage = error.message;
+    }
+    
+    console.error('Error sending to Telegram:', {
+      error,
+      message: errorMessage,
+      name: error?.name,
+      stack: error?.stack
+    });
+    
+    return { 
+      success: false, 
+      error: errorMessage 
+    };
+  }
+};
